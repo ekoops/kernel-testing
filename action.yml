@@ -26,6 +26,46 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Update packages information
+      run: |
+        sudo apt update -y
+
+    - name: Install ansible
+      run: |
+        sudo apt install -y software-properties-common
+        sudo add-apt-repository --yes --update ppa:ansible/ansible
+        sudo apt install -y ansible-core
+        ansible-galaxy install -r ${{ github.action_path }}/requirements.yml
+
+    - name: Install QEMU
+      run: |
+        sudo apt install -y qemu-system
+
+    - name: Install docker
+      run: |
+        # Add Docker's official GPG key:
+        sudo apt install -y ca-certificates curl
+        sudo install -m 0755 -d /etc/apt/keyrings
+        sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        sudo chmod a+r /etc/apt/keyrings/docker.asc
+        
+        # Add the repository to Apt sources:
+        echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        sudo apt update -y
+        # TODO: remove docker-compose installation and other unneeded components
+        sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    - name: Install skopeo and umoci
+      run: |
+        sudo apt install -y skopeo umoci
+
+    - name: Install socat
+      run: |
+        sudo apt install -y socat
+
     - name: Generate vars yaml
       working-directory: ${{ github.action_path }}/ansible-playbooks
       shell: bash

@@ -23,26 +23,6 @@
     state: directory
     mode: '0755'
 
-- name: Template the ignite-vm.yaml configuratin file for machines
-  ansible.builtin.template:
-    src: ignite-vm.yaml.j2
-    dest: "./roles/bootstrap/files/{{ item.name }}.yaml"
-    mode: '0755'
-  loop:
-    "{{ machines }}"
-  when: item.arch == ansible_facts["architecture"]
-  delegate_to: localhost
-
-- name: Template the ignite-vm.yaml configuratin file for builders
-  ansible.builtin.template:
-    src: ignite-vm.yaml.j2
-    dest: "./roles/bootstrap/files/{{ item.name }}.yaml"
-    mode: '0755'
-  loop:
-    "{{ builders }}"
-  when: item.arch == ansible_facts["architecture"]
-  delegate_to: localhost
-
 - name: Pull kernel and rootfs OCI images
   block:
     - name: Pull kernel OCI images
@@ -61,54 +41,190 @@
       loop: "{{ machines | union(builders) }}"
       when: item.arch == ansible_facts["architecture"]
 
-- name: Create virtual machines run_id={{ run_id }}
-  ansible.builtin.command:
-    cmd: ignite run --config "./roles/bootstrap/files/{{ item.name }}.yaml" --runtime docker
-  register: ignite_run
-  changed_when: ignite_run.rc == 0
-  loop: "{{ machines | union(builders) }}"
-  when: item.arch == ansible_facts["architecture"]
-  become: true
+- name: Extract vmlinux and initrd from kernel OCI images
+  vars:
+    kernel_basename: "{{ item.kernel | basename }}"
+  block:
+    - name: Convert kernel docker image to OCI image
+      ansible.builtin.command:
+        cmd: skopeo copy "docker://{{ item.kernel }}" "oci:./roles/bootstrap/files/oci_{{ kernel_basename }}"
+      args:
+        creates: "./roles/bootstrap/files/oci_{{ kernel_basename }}"
+      loop: "{{ machines | union(builders) }}"
+      when: item.arch == ansible_facts["architecture"]
+      become: true
 
-- name: Wait for the VMs to be running run_id={{ run_id }} # noqa: risky-shell-pipe
-  ansible.builtin.shell: |
-    if test -v BASH; then set -o pipefail; fi
-    ignite ps -f \{\{.ObjectMeta.Name\}\}={{ item.name }}-{{ run_id }},\{\{.Status.Running\}\}=true | wc -l
-  register: result
-  until: result.stdout | int == 2
-  retries: 5
-  delay: 10
-  loop: "{{ machines | union(builders) }}"
-  when: item.arch == ansible_facts["architecture"]
-  changed_when: result.stdout | int == 2
-  become: true
+    - name: Unpack kernel OCI image
+      ansible.builtin.command:
+        cmd: umoci unpack --image "./roles/bootstrap/files/oci_{{ kernel_basename }}" "./roles/bootstrap/files/bundle_{{ kernel_basename }}"
+      args:
+        creates: "./roles/bootstrap/files/bundle_{{ kernel_basename }}"
+      loop: "{{ machines | union(builders) }}"
+      when: item.arch == ansible_facts["architecture"]
+      become: true
 
-- name: Get IP of the VMs(machines) and register them in a variable run_id={{ run_id }}
-  ansible.builtin.command:
-    cmd: ignite ps -f \{\{.ObjectMeta.Name\}\}={{ item.name }}-{{ run_id }},\{\{.Status.Running\}\}=true -t \{\{.Status.Network.IPAddresses\}\}
-  register: machine_ips
-  failed_when: machine_ips.stdout_lines | length != 1
-  changed_when: machine_ips.stdout_lines | length == 1
-  loop: "{{ machines }}"
-  when: item.arch == ansible_facts["architecture"]
-  become: true
+- name: Generate raw disk images containing ext4 filesystem from rootfs OCI images
+  vars:
+    rootfs_basename: "{{ item.rootfs | basename }}"
+  block:
+    - name: Convert rootfs docker image to OCI image
+      ansible.builtin.command:
+        cmd: skopeo copy "docker://{{ item.rootfs }}" "oci:./roles/bootstrap/files/oci_{{ rootfs_basename }}"
+      args:
+        creates: "./roles/bootstrap/files/oci_{{ rootfs_basename }}"
+      loop: "{{ machines | union(builders) }}"
+      when: item.arch == ansible_facts["architecture"]
+      become: true
 
-- name: Get IP of the VMs(builders) and register them in a variable run_id={{ run_id }}
-  ansible.builtin.command:
-    cmd: ignite ps -f \{\{.ObjectMeta.Name\}\}={{ item.name }}-{{ run_id }},\{\{.Status.Running\}\}=true -t \{\{.Status.Network.IPAddresses\}\}
-  register: builders_ips
-  failed_when: builders_ips.stdout_lines | length != 1
-  changed_when: builders_ips.stdout_lines | length == 1
-  loop: "{{ builders }}"
-  when: item.arch == ansible_facts["architecture"]
-  become: true
+    - name: Unpack rootfs OCI image
+      ansible.builtin.command:
+        cmd: umoci unpack --image "./roles/bootstrap/files/oci_{{ rootfs_basename }}" "./roles/bootstrap/files/bundle_{{ rootfs_basename }}"
+      args:
+        creates: "./roles/bootstrap/files/bundle_{{ rootfs_basename }}"
+      loop: "{{ machines | union(builders) }}"
+      when: item.arch == ansible_facts["architecture"]
+      become: true
 
-- name: Template the inventory.ini.j2 configuration file to invetory.ini
-  ansible.builtin.template:
-    src: inventory.ini.j2
-    dest: inventory.ini
-    mode: '0755'
-  delegate_to: localhost
+    - name: Setup ssh
+      vars:
+        rootfs_bundle_dir: "./roles/bootstrap/files/bundle_{{ rootfs_basename }}/rootfs"
+      become: true
+      block:
+        - name: Ensure .ssh directory exists
+          when: item.arch == ansible_facts["architecture"]
+          loop: "{{ machines | union(builders) }}"
+          ansible.builtin.file:
+            path: "{{ rootfs_bundle_dir }}/root/.ssh"
+            state: directory
+            mode: '0700'
+            owner: root
+            group: root
 
-- name: Refresh inventory to ensure that the new generated one is used
-  ansible.builtin.meta: refresh_inventory
+        - name: Ensure authorized_keys file exists
+          when: item.arch == ansible_facts["architecture"]
+          loop: "{{ machines | union(builders) }}"
+          ansible.builtin.copy:
+            remote_src: yes
+            src: "{{ pub_key_path }}"
+            dest: "{{ rootfs_bundle_dir }}/root/.ssh/authorized_keys"
+            mode: '0600'
+            owner: root
+            group: root
+
+    # todo(ekoops): only run this if the bundle haven't changed
+    - name: Generate raw disk image containing ext4 filesystem from rootfs OCI image
+      vars:
+        rootfs_basename: "{{ item.rootfs | basename }}"
+        rootfs_bundle_dir: "./roles/bootstrap/files/bundle_{{ rootfs_basename }}/rootfs"
+        disk_image: "./roles/bootstrap/files/disk_{{ rootfs_basename }}.ext4"
+        mount_point: "/tmp/{{ rootfs_basename }}"
+      ansible.builtin.shell: |
+        set -e
+        truncate -s 5G "{{ disk_image }}"
+        mkfs.ext4 -F "{{ disk_image }}"
+        mkdir -p "{{ mount_point }}"
+        mount -o loop "{{ disk_image }}" "{{ mount_point }}"
+        cp -a "{{ rootfs_bundle_dir }}/." "{{ mount_point }}"
+        umount "{{ mount_point }}"
+        rm -rf "{{ mount_point }}"
+        resize2fs -M "{{ disk_image }}"
+        e2fsck -y -f "{{ disk_image }}"
+      loop: "{{ machines | union(builders) }}"
+      when: item.arch == ansible_facts["architecture"]
+      args:
+        creates: "{{ disk_image }}"
+      become: true
+
+#- name: Create VMs run_id={{ run_id }}
+#  vars:
+#    kernel_basename: "{{ item.kernel | basename }}"
+#    rootfs_basename: "{{ item.rootfs | basename }}"
+#    kernel_bundle_dir: "./roles/bootstrap/files/bundle_{{ kernel_basename }}/rootfs"
+#    vm_name: "{{ item.name }}_{{ run_id }}"
+#    vmlinux_path: "{{ kernel_bundle_dir }}/boot/vmlinux"
+#    initrd_path: "{{ kernel_bundle_dir }}/boot/initrd"
+#    rootfs_disk_path: "./roles/bootstrap/files/disk_{{ rootfs_basename }}.ext4"
+#    monitor_socket_path: "/tmp/monitor_{{ vm_name }}.sock"
+#    vm_logs_path: "/tmp/logs_{{ vm_name }}.log"
+#  ansible.builtin.command: >
+#    qemu-system-x86_64
+#      --name "{{ vm_name }}"
+#      --machine microvm
+#      --enable-kvm
+#      --cpu host
+#      --smp "{{ cpus }}"
+#      -m "{{ memory }}G"
+#      --kernel "{{ vmlinux_path }}"
+#      --initrd "{{ initrd_path }}"
+#      --daemonize
+#      --display none
+#      --append "rw console=ttyS0"
+#      --serial file:{{ vm_logs_path }}
+#      --drive if=none,file="{{ rootfs_disk_path }}",format=raw,id=hd0
+#      --device virtio-blk-device,drive=hd0
+#      --netdev user,id=net0,hostfwd=tcp:127.0.0.1:0-:22
+#      --device virtio-net-device,netdev=net0
+#      --monitor unix:"{{ monitor_socket_path }}",server,nowait
+#  register: qemu_create_vm
+#  changed_when: qemu_create_vm.rc == 0
+#  loop: "{{ machines | union(builders) }}"
+#  when: item.arch == ansible_facts["architecture"]
+#  become: true
+#  tags:
+#    - spawn_vms
+#
+#- name: Wait for the VMs to be running run_id={{ run_id }} # noqa: risky-shell-pipe
+#  vars:
+#    vm_name: "{{ item.name }}_{{ run_id }}"
+#    monitor_socket_path: "/tmp/monitor_{{ vm_name }}.sock"
+#  ansible.builtin.shell: |
+#    if test -v BASH; then set -o pipefail; fi
+#    echo "info status" | socat - UNIX-CONNECT:"{{ monitor_socket_path }}" | grep -q 'VM status: running'
+#  register: result
+#  until: result.rc == 0
+#  retries: 5
+#  delay: 10
+#  loop: "{{ machines | union(builders) }}"
+#  loop_control:
+#    loop_var: item
+#  when: item.arch == ansible_facts["architecture"]
+#  changed_when: false
+#  become: true
+#
+#- name: Get IP and port of the VMs(machines) and register them in a variable run_id={{ run_id }} # noqa: risky-shell-pipe
+#  vars:
+#    vm_name: "{{ item.name }}_{{ run_id }}"
+#    monitor_socket_path: "/tmp/monitor_{{ vm_name }}.sock"
+#  ansible.builtin.shell: |
+#    if test -v BASH; then set -o pipefail; fi
+#    echo "info usernet" | socat - UNIX-CONNECT:"{{ monitor_socket_path }}" | grep 'TCP\[HOST_FORWARD\]' | tr -s ' ' | cut -d ' ' -f 4,5
+#  register: machine_ips
+#  failed_when: machine_ips.stdout_lines | length != 1
+#  changed_when: machine_ips.stdout_lines | length == 1
+#  loop: "{{ machines }}"
+#  when: item.arch == ansible_facts["architecture"]
+#  become: true
+#
+#- name: Get IP and port of the VMs(builders) and register them in a variable run_id={{ run_id }} # noqa: risky-shell-pipe
+#  vars:
+#    vm_name: "{{ item.name }}_{{ run_id }}"
+#    monitor_socket_path: "/tmp/monitor_{{ vm_name }}.sock"
+#  ansible.builtin.shell: |
+#    if test -v BASH; then set -o pipefail; fi
+#    echo "info usernet" | socat - UNIX-CONNECT:"{{ monitor_socket_path }}" | grep 'TCP\[HOST_FORWARD\]' | tr -s ' ' | cut -d ' ' -f 4,5
+#  register: builders_ips
+#  failed_when: builders_ips.stdout_lines | length != 1
+#  changed_when: builders_ips.stdout_lines | length == 1
+#  loop: "{{ builders }}"
+#  when: item.arch == ansible_facts["architecture"]
+#  become: true
+#
+#- name: Template the inventory.ini.j2 configuration file to inventory.ini
+#  ansible.builtin.template:
+#    src: inventory.ini.j2
+#    dest: inventory.ini
+#    mode: '0755'
+#  delegate_to: localhost
+#
+#- name: Refresh inventory to ensure that the new generated one is used
+#  ansible.builtin.meta: refresh_inventory
